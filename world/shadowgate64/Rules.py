@@ -30,6 +30,9 @@ class Shadowgate64Rules:
             locationName.LOC_DIRTY_SLIPPER: lambda state: self.has_ancient_coin(state),
             locationName.LOC_PAIR_OF_SLIPPERS: lambda state: self.both_slippers(state),
             locationName.LOC_TREASURE: lambda state: self.reliquish_treasure(state),
+            locationName.LOC_CHIPPED_VIOLIN: lambda state: self.can_trade_violin(state),
+            locationName.LOC_BROKEN_VIOLIN: lambda state: self.can_trade_violin(state),
+            locationName.LOC_STRINGLESS_VIOLIN: lambda state: self.can_trade_violin(state),
             locationName.LOC_JEZIBEL_PENDANT: lambda state: self.speak_to_ded_mom(state),
             locationName.LOC_FAMILY_DIARY: lambda state: self.speak_to_ded_mom(state),
             locationName.LOC_DUNGEON_KEY: lambda state: self.distract_guard(state),
@@ -176,6 +179,10 @@ class Shadowgate64Rules:
     
     def has_crest_fragments(self, state: CollectionState) -> bool:
         return state.has(itemName.FRAGMENTS_OF_CREST, self.player)
+    
+    def can_trade_violin(self, state:CollectionState) -> bool:
+        return state.has(itemName.TREASURE, self.player) or \
+        state.has(itemName.CHIPPED_VIOLIN, self.player)
 
     def set_rules(self) -> None:
         for location, rules in self.item_rules.items():
