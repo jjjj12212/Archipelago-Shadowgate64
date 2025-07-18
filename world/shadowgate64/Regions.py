@@ -216,8 +216,9 @@ def connect_regions(self):
                                   })
     
     next_working_region = multiworld.get_region(regionName.TOWER1_ENTRANCE, player)
-    next_working_region.add_exits({regionName.SEWER_PRISON, regionName.TOWER1_UPSTAIRS,
+    next_working_region.add_exits({regionName.SEWER_PRISON, regionName.SEWER_ACROSS, regionName.TOWER1_UPSTAIRS,
                                    regionName.CEMETERY_AND_SANTUARY, regionName.OUTSIDE, regionName.ALERTED_TOWN},{
+                                  regionName.SEWER_ACROSS: lambda state: rules.has_rusty_key(state),
                                   regionName.SEWER_PRISON: lambda state: rules.has_pickaxe(state),
                                   regionName.CEMETERY_AND_SANTUARY: lambda state: rules.tower_to_cementery(state),
                                   regionName.OUTSIDE: lambda state: rules.from_disciple_tower_to_shadowgate(state),
