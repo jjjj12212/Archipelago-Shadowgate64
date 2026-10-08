@@ -165,18 +165,6 @@ class Shadowgate64CommandProcessor(ClientCommandProcessor):
         if isinstance(self.ctx, Shadowgate64Context):
             logger.info(f"N64 Status: {self.ctx.n64_status}")
 
-    def _cmd_writesettings(self):
-            """Manually push slot settings into BTHACK memory via emu_loader (the ROM refuses to boot until settings are populated)."""
-            if not isinstance(self.ctx, Shadowgate64Context):
-                return
-            ctx = self.ctx
-            if ctx.emu_loader is None or not ctx.emu_loader.is_connected():
-                return
-            if not ctx.slot_data:
-                return
-            if emu_game.write_slot_settings(ctx.emu_loader, ctx.slot_data):
-                ctx.emu_settings_written = True
-
 
 class Shadowgate64Context(CommonContext):
     command_processor = Shadowgate64CommandProcessor
