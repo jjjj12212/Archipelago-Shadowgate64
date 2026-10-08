@@ -62,7 +62,6 @@ class Shadowgate64World(World):
     options: Shadowgate64Options
 
     def __init__(self, world, player):
-        self.version = "V0.1"
         super(Shadowgate64World, self).__init__(world, player)
         
     def item_code(self, itemname: str) -> int:
@@ -100,9 +99,6 @@ class Shadowgate64World(World):
                 for i in range(itemData.qty):
                     itempool += [self.create_item(name)]
         self.multiworld.itempool.extend(itempool)
-        # for item in itempool:
-        #     self.multiworld.itempool.append(item)
-
 
     def item_filter(self, item_name: str) -> bool:
         if item_name == itemName.BONE or item_name == itemName.WATER or item_name == itemName.WATER_DRAGON_TEARS \
@@ -192,5 +188,5 @@ class Shadowgate64World(World):
         options = self.options.as_dict("open_disciple_tower_doors")
         options["player_name"] = self.multiworld.player_name[self.player]
         options["seed"] = self.random.randint(12212, 9090763)
-        options["version"] = self.version
+        options["version"] = self.world_version.as_simple_string()
         return options

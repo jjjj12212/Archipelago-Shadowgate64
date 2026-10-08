@@ -15,7 +15,6 @@ import zipfile
 from asyncio import StreamReader, StreamWriter
 import bsdiff4
 
-
 # CommonClient import first to trigger ModuleUpdater
 from CommonClient import CommonContext, server_loop, gui_enabled, \
     ClientCommandProcessor, logger, get_base_parser
@@ -23,6 +22,86 @@ import Utils
 import settings
 from Utils import async_start
 from worlds import network_data_package
+from . import Shadowgate64World
+from .client import state as emu_state, game as emu_game
+
+
+# For when its a global package
+try:
+    from emu_loader import EmuLoaderClient, ProcessMemory
+# For when its in the apworld itself
+except ImportError:
+    from .emu_loader import EmuLoaderClient, ProcessMemory
+
+# BTHACK signature validation
+RDRAM_BASE = 0x80000000  # KSEG0 start; RDRAM mirror
+RDRAM_SIZE = 0x800000  # 8 MB with expansion pak (required by SG)
+SGHACK_ANCHOR_OFFSET = 0x400000  # physical RDRAM offset of AP_MEMORY_PTR
+SGHACK_STRUCT_SIZE = 502
+
+
+def is_rdram_pointer(value: int) -> bool:
+    return RDRAM_BASE <= value < RDRAM_BASE + RDRAM_SIZE
+
+class SGEmuLoaderClient(EmuLoaderClient):
+    """EmuLoaderClient with SGHACK pointer-chase helpers."""
+
+    def __init__(self) -> None:
+        super().__init__(validation_func= validate_bt_signature)
+
+    def deref(self, address: int) -> int | None:
+        ptr = self.read_u32(address)
+        return ptr & 0x7FFFFFFF if is_rdram_pointer(ptr) else None
+
+    def get_anchor(self) -> int | None:
+        return self.deref(RDRAM_BASE + SGHACK_ANCHOR_OFFSET)
+
+    def get_rom_version(self) -> tuple[int, int, int] | None:
+        anchor = self.get_anchor()
+        if anchor is None:
+            return None
+        major = self.read_u8(RDRAM_BASE + anchor + 0x4)
+        minor = self.read_u8(RDRAM_BASE + anchor + 0x5)
+        patch = self.read_u8(RDRAM_BASE + anchor + 0x6)
+        return (major, minor, patch)
+
+
+def validate_bt_signature(pm: ProcessMemory, rdram_base: int) -> bool:
+    """Return True if ``rdram_base`` looks like AP-Banjo-Tooie RDRAM.
+
+    - u32 at ``rdram_base + 0x400000`` must be a valid 0x80xxxxxx pointer
+      (BTHACK's ``AP_MEMORY_PTR``).
+    - At the dereferenced ``ap_memory_ptr_t`` struct, all 12 sub-pointers
+      at offsets 0x04..0x30 must themselves be valid RDRAM pointers. The
+      patch's ``inject_hooks()`` populates every one of them at game boot.
+    """
+    try:
+        anchor = int.from_bytes(
+            pm.read_bytes(rdram_base + SGHACK_ANCHOR_OFFSET, 4), "little"
+        )
+    except Exception:
+        return False
+    if not is_rdram_pointer(anchor):
+        return False
+    physical = anchor & 0x7FFFFFFF
+    if physical + SGHACK_STRUCT_SIZE > RDRAM_SIZE:
+        return False
+    try:
+        #struct_bytes = pm.read_bytes(rdram_base + physical, 3)
+        val = pm.read_bytes(rdram_base + physical, 4)
+        if val == b'\x00\x00\x00\x00\x00\x00\x00\x00' or val == b'\x00\x00\x00\x00':
+            return False
+        if val == b'"!!\x12':
+            return True
+        else:
+            return False
+    except Exception:
+        return False
+    # for offset in BTHACK_SUB_POINTER_OFFSETS:
+    #     sub_ptr = int.from_bytes(struct_bytes[offset : offset + 4], "little")
+    #     if not is_rdram_pointer(sub_ptr):
+    #         return False
+    return True
 
 SYSTEM_MESSAGE_ID = 0
 
@@ -36,9 +115,9 @@ CONNECTION_INITIAL_STATUS = "Connection has not been initiated"
 sg_loc_name_to_id = network_data_package["games"]["Shadowgate 64"]["location_name_to_id"]
 sg_itm_name_to_id = network_data_package["games"]["Shadowgate 64"]["item_name_to_id"]
 script_version: int = 1
-version: str = "V0.1"
-game_append_version: str = "V01"
-patch_md5: str = "9d369956a0d42a8700c8263651a06a81"
+version: str = Shadowgate64World.world_version.as_simple_string()
+game_append_version: str = "V01_0_1"
+patch_md5: str = "9778e82f207425f9d9ae8cc4c4673e64"
 
 def get_item_value(ap_id):
     return ap_id
@@ -86,6 +165,18 @@ class Shadowgate64CommandProcessor(ClientCommandProcessor):
         if isinstance(self.ctx, Shadowgate64Context):
             logger.info(f"N64 Status: {self.ctx.n64_status}")
 
+    def _cmd_writesettings(self):
+            """Manually push slot settings into BTHACK memory via emu_loader (the ROM refuses to boot until settings are populated)."""
+            if not isinstance(self.ctx, Shadowgate64Context):
+                return
+            ctx = self.ctx
+            if ctx.emu_loader is None or not ctx.emu_loader.is_connected():
+                return
+            if not ctx.slot_data:
+                return
+            if emu_game.write_slot_settings(ctx.emu_loader, ctx.slot_data):
+                ctx.emu_settings_written = True
+
 
 class Shadowgate64Context(CommonContext):
     command_processor = Shadowgate64CommandProcessor
@@ -98,6 +189,16 @@ class Shadowgate64Context(CommonContext):
         self.n64_streams: (StreamReader, StreamWriter) = None # type: ignore
         self.n64_sync_task = None
         self.n64_status = CONNECTION_INITIAL_STATUS
+        self.emu_loader: SGEmuLoaderClient | None = None
+        self.emu_monitor_task: asyncio.Task | None = None
+        self.version_warning = False
+        self.emu_settings_written: bool = False
+        self.emu_last_items_count: int = -1
+        self.emu_sent_world_entrances: set[int] = set()
+        self.emu_goal_printed: bool = False
+        self.emu_waiting_logged: bool = False
+        self.emu_attached_logged: bool = False
+        self.emu_status: str = "Not attached"
         self.awaiting_rom = False
         self.messages = {}
         self.slot_data = {}
@@ -105,7 +206,8 @@ class Shadowgate64Context(CommonContext):
         self.item_check_table = {}
         self.book_check_table = {}
         self.note_check_table = {}
-        self.check_location_table = {}
+        self.check_location_table = []
+        self.settings_processed = False
 
     async def server_auth(self, password_requested: bool = False):
         if password_requested and not self.password:
@@ -152,7 +254,6 @@ class Shadowgate64Context(CommonContext):
                     archipelago_root = pathlib.Path(__file__).parents[i]
                     break
             async_start(run_game(os.path.join(archipelago_root, "Shadowgate64"+game_append_version+".n64")))
-            self.n64_sync_task = asyncio.create_task(n64_sync_task(self), name="N64 Sync")
         elif cmd == "ReceivedItems":
             if self.startup == False:
                 for item in args["items"]:
@@ -277,83 +378,104 @@ async def parse_payload(payload: dict, ctx: Shadowgate64Context, force: bool):
         ctx._set_message("You have completed your goal", None)
 
 
-async def n64_sync_task(ctx: Shadowgate64Context):
-    logger.info("Starting n64 connector. Use /n64 for status information.")
+async def emu_loader_monitor_task(ctx: Shadowgate64Context):
+    """Direct-emulator-memory bridge."""
+    poll_interval = 0.2
+
+    # wait_for_emulator() has its own internal retry loop
+    # lets instead do this just one time so we dont get spammed
+    logger.info(
+        "Waiting for a supported emulator to attach... "
+    )
+    ctx.emu_waiting_logged = True
+
     while not ctx.exit_event.is_set():
-        error_status = None
-        if ctx.n64_streams:
-            (reader, writer) = ctx.n64_streams
-            if ctx.sendSlot == True:
-                msg = get_slot_payload(ctx).encode()
-            else:
-                msg = get_payload(ctx).encode()
-            writer.write(msg)
-            writer.write(b'\n')
+      ctx.emu_status = "Waiting for emulator"
+      ctx.emu_loader = SGEmuLoaderClient()
+      ctx.emu_settings_written = False
+      ctx.emu_last_items_count = -1
+      ctx.emu_sent_world_entrances.clear()
+      ctx.emu_goal_printed = False
+      setattr(emu_loader_monitor_task, "_prev", None)
+      await ctx.emu_loader.wait_for_emulator()
+
+      if ctx.exit_event.is_set():
+          return
+
+      emu_name = ctx.emu_loader.emulator_info.id
+      logger.info(f"Connected to {emu_name}.")
+      ctx.emu_status = f"Connected to {emu_name}"
+      ctx.emu_attached_logged = True
+
+      while not ctx.exit_event.is_set():
+        try:
+            if ctx.version_warning:
+                logger.error(f"ERROR: Your Patched ROM is version {ctx.rom_version}, expected {version}. " +
+                    "Please update to the latest version.")
+                return
+
+            sgh = emu_state.SGHReader(ctx.emu_loader)
+
+            rom_version_tuple = ctx.emu_loader.get_rom_version()
+            if rom_version_tuple is not None and rom_version_tuple[0] > 0 and ctx.version_warning is False:
+                ctx.rom_version = str(rom_version_tuple[0]) +"."+ str(rom_version_tuple[1]) + "." + str(rom_version_tuple[2])
+                if version != ctx.rom_version:
+                    ctx.version_warning = True
+                    continue
+            if ctx.slot_data and not ctx.settings_processed:
+                emu_game.write_slot_settings(ctx.emu_loader, ctx.slot_data)
+                ctx.settings_processed = True
+            
+
+            current_items_count = len(ctx.items_received) if ctx.items_received else 0
+            if (ctx.settings_processed and current_items_count != ctx.emu_last_items_count):
+                emu_game.write_received_items(ctx.emu_loader, ctx.items_received)
+                ctx.emu_last_items_count = current_items_count
+
+            if ctx.messages and ctx.auth:
+                consumed = emu_game.drain_item_messages(
+                    ctx.emu_loader, ctx.messages, ctx.auth)
+                if consumed:
+                    ctx.messages.pop(consumed, None)
+
+            if not ctx.finished_game and ctx.server is not None:
+                if emu_game.check_victory(ctx.emu_loader):
+                    await ctx.send_msgs([{"cmd": "StatusUpdate", "status": 30}])
+                    ctx.finished_game = True
+
+
+            collected = emu_state.poll_all_locations(sgh)
+            new_sgid = []
+            for loc_id, value in collected.items():
+                if value and loc_id not in ctx.check_location_table:
+                    new_sgid.append(loc_id) 
+                    ctx.check_location_table.append(loc_id)
+
+
+            if new_sgid and ctx.server is not None:
+                await ctx.send_msgs([{
+                    "cmd": "LocationChecks",
+                    "locations": new_sgid,
+                }])
+
+            # setattr(emu_loader_monitor_task, "_prev", collected)
+        except Exception:
+            logger.exception("Shadowgate64 emulator monitor lost its connection; reconnecting")
+            ctx.emu_status = "Lost emulator connection; reconnecting..."
             try:
-                await asyncio.wait_for(writer.drain(), timeout=1.5)
-                try:
-                    data = await asyncio.wait_for(reader.readline(), timeout=10)
-                    data_decoded = json.loads(data.decode())
-                    reported_version = data_decoded.get('scriptVersion', 0)
-                    getSlotData = data_decoded.get('getSlot', 0)
-                    if getSlotData == True:
-                        ctx.sendSlot = True
-                    elif reported_version >= script_version:
-                        if ctx.game is not None and 'sync_ready' in data_decoded:
-                            # Not just a keep alive ping, parse
-                            async_start(parse_payload(data_decoded, ctx, False))
-                        if not ctx.auth:
-                            ctx.auth = data_decoded['playerName']
-                            if ctx.awaiting_rom:
-                                await ctx.server_auth(False)
-                    else:
-                        if not ctx.version_warning:
-                            logger.warning(f"Your Lua script is version {reported_version}, expected {script_version}. "
-                                "Please update to the latest version. "
-                                "Your connection to the Archipelago server will not be accepted.")
-                            ctx.version_warning = True
-                except asyncio.TimeoutError:
-                    logger.debug("Read Timed Out, Reconnecting")
-                    error_status = CONNECTION_TIMING_OUT_STATUS
-                    writer.close()
-                    ctx.n64_streams = None
-                except ConnectionResetError as e:
-                    logger.debug("Read failed due to Connection Lost, Reconnecting")
-                    error_status = CONNECTION_RESET_STATUS
-                    writer.close()
-                    ctx.n64_streams = None
-            except TimeoutError:
-                logger.debug("Connection Timed Out, Reconnecting")
-                error_status = CONNECTION_TIMING_OUT_STATUS
-                writer.close()
-                ctx.n64_streams = None
-            except ConnectionResetError:
-                logger.debug("Connection Lost, Reconnecting")
-                error_status = CONNECTION_RESET_STATUS
-                writer.close()
-                ctx.n64_streams = None
-            if ctx.n64_status == CONNECTION_TENTATIVE_STATUS:
-                if not error_status:
-                    logger.info("Successfully Connected to N64")
-                    ctx.n64_status = CONNECTION_CONNECTED_STATUS
-                else:
-                    ctx.n64_status = f"Was tentatively connected but error occured: {error_status}"
-            elif error_status:
-                ctx.n64_status = error_status
-                logger.info("Lost connection to N64 and attempting to reconnect. Use /n64 for status updates")
-        else:
-            try:
-                logger.debug("Attempting to connect to N64")
-                ctx.n64_streams = await asyncio.wait_for(asyncio.open_connection("localhost", 21222), timeout=10)
-                ctx.n64_status = CONNECTION_TENTATIVE_STATUS
-            except TimeoutError:
-                logger.debug("Connection Timed Out, Trying Again")
-                ctx.n64_status = CONNECTION_TIMING_OUT_STATUS
-                continue
-            except ConnectionRefusedError:
-                logger.debug("Connection Refused, Trying Again")
-                ctx.n64_status = CONNECTION_REFUSED_STATUS
-                continue
+                if ctx.emu_loader is not None:
+                    ctx.emu_loader.disconnect()
+            except Exception:
+                pass
+            ctx.emu_loader = None
+            break
+
+        try:
+            await asyncio.wait_for(ctx.exit_event.wait(), timeout=poll_interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+
 
 def read_file(path):
     with open(path, 'rb') as fi:
@@ -418,7 +540,8 @@ def main():
         multiprocessing.freeze_support()
 
         ctx = Shadowgate64Context(args.connect, args.password)
-        ctx.server_task = asyncio.create_task(server_loop(ctx), name="Server Loop")
+        #ctx.server_task = asyncio.create_task(server_loop(ctx), name="Server Loop")
+        ctx.emu_monitor_task = asyncio.create_task(emu_loader_monitor_task(ctx), name="EmuLoader Monitor")
         if gui_enabled:
             ctx.run_gui()
         ctx.run_cli()
@@ -430,6 +553,17 @@ def main():
 
         if ctx.n64_sync_task:
             await ctx.n64_sync_task
+
+        if ctx.emu_monitor_task:
+            try:
+                await asyncio.wait_for(ctx.emu_monitor_task, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            if ctx.emu_loader is not None:
+                try:
+                    ctx.emu_loader.disconnect()
+                except Exception:
+                    pass
 
     import colorama
 
