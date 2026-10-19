@@ -17,7 +17,7 @@ from worlds.LauncherComponents import Component, components, Type, launch_subpro
 
 
 def run_client():
-    from worlds.shadowgate64.Sg64Client import main  # lazy import
+    from .Sg64Client import main  # lazy import
     launch_subprocess(main)
 
 components.append(Component("Shadowgate 64 Client", func=run_client, component_type=Type.CLIENT))
